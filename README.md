@@ -27,7 +27,7 @@
 
 ## 配置
 
-1.  **OCI API 密钥:** 你需要先在你的 OCI 账户中为你希望使用的用户生成 API 密钥对，并获取必要的 OCID 信息（User OCID, Tenancy OCID, Fingerprint, Region）。请参考 [OCI官方文档：Required Keys and OCIDs](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm或者https://github.com/cooderl/oci-help-enhanced?tab=readme-ov-file项目)。
+1.  **OCI API 密钥:** 你需要先在你的 OCI 账户中为你希望使用的用户生成 API 密钥对，并获取必要的 OCID 信息（User OCID, Tenancy OCID, Fingerprint, Region）。请参考 https://github.com/cooderl/oci-help-enhanced?tab=readme-ov-file项目。
 2.  **准备 OCI 配置文件:** 创建一个标准的 OCI `config` 文件（通常位于 `~/.oci/config`），包含你想要导入的账号配置节（例如 `[DEFAULT]`, `[PROFILE1]` 等），并确保 `key_file` 指向正确的私钥文件路径。
 3.  **导入账号:**
     * 运行本工具。
