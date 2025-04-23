@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.env
+*.env
+
+# IDE / Editor specific files
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts / Distribution
+build/
+dist/
+*.egg-info/
+
+# Script-specific generated files (IMPORTANT!)
+oci_gui_profiles.json
+oci_gui_settings.json
+# 如果你有其他不想上传的文件，也加在这里
+
+# macOS specific
+.DS_Store
