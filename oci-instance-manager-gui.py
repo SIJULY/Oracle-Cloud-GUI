@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Final Corrected Version (Simplified Edit/Import, Fixed Instance Creation Logic, Full Code)
+# Final Corrected Version (Fixed action_name typo in confirm_and_run_action)
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import oci
@@ -25,6 +25,7 @@ DEFAULT_OCI_CONFIG_PATH = os.path.expanduser("~/.oci/config")
 
 
 # --- Backend OCI 操作函数 ---
+# (No changes needed in backend functions for this fix)
 def get_detailed_instances(compute_client, virtual_network_client, block_storage_client, compartment_id):
     instance_list_for_gui = []
     try:
@@ -48,14 +49,73 @@ def get_detailed_instances(compute_client, virtual_network_client, block_storage
     except oci.exceptions.ServiceError as e: return [], f"获取实例列表失败: {e.status} {e.code} - {e.message}\n请检查权限和区间OCID。"
     except Exception as e: return [], f"获取实例列表时发生意外错误: {e}"
 
-def backend_change_public_ip(virtual_network_client, vnic_id):
+# **** CORRECTED: Use update_private_ip instead of update_vnic ****
+# **** FINAL ATTEMPT: Use create/delete public_ip API ****
+# **** FINAL ATTEMPT: Use create/delete public_ip API ****
+def backend_change_public_ip(virtual_network_client, vnic_id, compartment_id): # Ensure compartment_id is accepted
+    """ Backend logic: Change public IP using get/delete/create PublicIp operations """
+    print(f"开始更换 VNIC {vnic_id} 的公网 IP (通过操作PublicIp对象)...")
+    primary_private_ip_id = None
     try:
-        virtual_network_client.update_vnic(vnic_id=vnic_id, update_vnic_details=oci.core.models.UpdateVnicDetails(assign_public_ip=False)); time.sleep(5)
-        virtual_network_client.update_vnic(vnic_id=vnic_id, update_vnic_details=oci.core.models.UpdateVnicDetails(assign_public_ip=True)); time.sleep(10)
-        new_public_ip = virtual_network_client.get_vnic(vnic_id=vnic_id).data.public_ip or "None (等待分配或失败)"
-        return True, f"IP更换命令已发送。新公网IP: {new_public_ip}"
-    except oci.exceptions.ServiceError as e: return False, f"更换IP失败: {e.status} {e.code} - {e.message}\n请检查权限和VNIC ID。"
-    except Exception as e: return False, f"更换IP时发生意外错误: {e}"
+        # 1. Find the Primary Private IP OCID attached to the VNIC
+        print(f"  - 查找 VNIC {vnic_id} 的主私有 IP...")
+        list_private_ips_response = oci.pagination.list_call_get_all_results(
+            virtual_network_client.list_private_ips,
+            vnic_id=vnic_id
+        )
+        primary_private_ip = None
+        if list_private_ips_response.data:
+            for private_ip_obj in list_private_ips_response.data:
+                if private_ip_obj.is_primary:
+                    primary_private_ip = private_ip_obj; break
+        if not primary_private_ip: return False, f"未能在 VNIC {vnic_id} 上找到主私有 IP。"
+        primary_private_ip_id = primary_private_ip.id
+        print(f"  - 找到主私有 IP OCID: {primary_private_ip_id}")
+
+        # 2. Find and Delete Existing *Ephemeral* Public IP associated with the Private IP
+        print(f"  - 查找当前关联的公网 IP (私有 IP: {primary_private_ip_id})...")
+        existing_public_ip = None
+        try:
+            get_public_ip_details = oci.core.models.GetPublicIpByPrivateIpIdDetails(private_ip_id=primary_private_ip_id)
+            existing_public_ip_response = virtual_network_client.get_public_ip_by_private_ip_id(get_public_ip_details)
+            existing_public_ip = existing_public_ip_response.data
+            print(f"  - 找到现有公网 IP: {existing_public_ip.ip_address} (OCID: {existing_public_ip.id}, Lifetime: {existing_public_ip.lifetime})")
+
+            if existing_public_ip and existing_public_ip.lifetime == oci.core.models.PublicIp.LIFETIME_EPHEMERAL:
+                print(f"  - 步骤 1: 删除现有的临时公网 IP {existing_public_ip.id}...")
+                virtual_network_client.delete_public_ip(existing_public_ip.id)
+                print("  - 删除请求已发送，等待 5 秒...")
+                time.sleep(5)
+            elif existing_public_ip:
+                print(f"  - 注意：找到的公网 IP ({existing_public_ip.ip_address}) 不是临时的，不会自动删除。")
+
+        except oci.exceptions.ServiceError as get_pub_ip_error:
+            if get_pub_ip_error.status == 404: print("  - 未找到当前关联的公网 IP，继续...")
+            else: raise
+
+        # 3. Create a new Ephemeral Public IP and assign it to the Private IP
+        print(f"  - 步骤 2: 创建新的临时公网 IP 并关联到私有 IP {primary_private_ip_id}...")
+        # Use the passed compartment_id (likely tenancy root)
+        create_public_ip_details = oci.core.models.CreatePublicIpDetails(
+            compartment_id=compartment_id,
+            lifetime=oci.core.models.PublicIp.LIFETIME_EPHEMERAL,
+            private_ip_id=primary_private_ip_id
+        )
+        create_public_ip_response = virtual_network_client.create_public_ip(create_public_ip_details)
+        new_public_ip_obj = create_public_ip_response.data
+        new_public_ip_address = new_public_ip_obj.ip_address
+        print(f"  - 新公网 IP 创建请求已发送。新 IP 地址: {new_public_ip_address} (OCID: {new_public_ip_obj.id})")
+        print("  - 等待 IP 分配稳定...")
+        time.sleep(10)
+
+        return True, f"IP 更换请求已发送 (通过操作PublicIp)。新公网IP: {new_public_ip_address}"
+
+    except oci.exceptions.ServiceError as e:
+        error_msg = f"更换 IP (操作PublicIp)失败: {e.status} {e.code} - {e.message}"
+        if e.status in [401, 403, 404]: error_msg += "\n请检查 'manage public-ips', 'use private-ips' 等权限及相关 OCID。"
+        return False, error_msg
+    except Exception as e:
+        return False, f"更换 IP (操作PublicIp) 时发生意外错误: {e}"
 
 def backend_restart_instance(compute_client, instance_id):
     try:
@@ -81,47 +141,20 @@ def backend_list_subnets(vnet_client, compartment_id):
     except Exception as e: error = f"获取子网列表意外错误: {e}"; print(error)
     return subnets, error
 
-# **** CORRECTED: Simplified Signature - No compartment ID needed ****
-# **** Searches Tenancy Root for platform images ****
 def backend_find_image_ocid(compute_client, os_name, os_version, shape_name):
-    """ Finds the latest compatible platform image OCID based on criteria (searches Tenancy Root) """
     try:
-        # ** Get Tenancy OCID from the client's config **
         tenancy_id = compute_client.base_client.config.get('tenancy')
-        if not tenancy_id:
-             return None, "无法从当前配置中获取 Tenancy OCID。"
-
+        if not tenancy_id: return None, "无法从当前配置中获取 Tenancy OCID。"
         print(f"查找镜像: os='{os_name}', version='{os_version}', shape='{shape_name}' (在租户 {tenancy_id} 中搜索)")
-
-        list_images_response = oci.pagination.list_call_get_all_results(
-            compute_client.list_images,
-            compartment_id=tenancy_id, # **** ALWAYS search in Tenancy Root ****
-            operating_system=os_name,
-            operating_system_version=os_version,
-            shape=shape_name,
-            sort_by="TIMECREATED",
-            sort_order="DESC",
-            lifecycle_state = oci.core.models.Image.LIFECYCLE_STATE_AVAILABLE
-        )
+        list_images_response = oci.pagination.list_call_get_all_results(compute_client.list_images, compartment_id=tenancy_id, operating_system=os_name, operating_system_version=os_version, shape=shape_name, sort_by="TIMECREATED", sort_order="DESC", lifecycle_state = oci.core.models.Image.LIFECYCLE_STATE_AVAILABLE)
         if list_images_response.data:
-            latest_image = list_images_response.data[0]
-            print(f"在租户根区间找到镜像: {latest_image.display_name} ({latest_image.id})")
-            return latest_image.id, None
-        else:
-            error_msg = f"在租户根区间未找到与 '{os_name} {os_version} ({shape_name})' 兼容的可用平台镜像。"
-            print(error_msg)
-            return None, error_msg
-
+            latest_image = list_images_response.data[0]; print(f"在租户根区间找到镜像: {latest_image.display_name} ({latest_image.id})"); return latest_image.id, None
+        else: error_msg = f"在租户根区间未找到与 '{os_name} {os_version} ({shape_name})' 兼容的可用平台镜像。"; print(error_msg); return None, error_msg
     except oci.exceptions.ServiceError as e:
-        error_msg = f"查找镜像失败: {e.status} {e.code} - {e.message}"
-        if e.status in [401, 403, 404]:
-            error_msg += "\n请检查是否拥有在租户根区间 'inspect images' 的权限。"
-        print(error_msg)
-        return None, error_msg
-    except Exception as e:
-        error_msg = f"查找镜像时发生意外错误: {e}"
-        print(error_msg)
-        return None, error_msg
+        error_msg = f"查找镜像失败: {e.status} {e.code} - {e.message}";
+        if e.status in [401, 403, 404]: error_msg += "\n请检查是否拥有在租户根区间 'inspect images' 的权限。"
+        print(error_msg); return None, error_msg
+    except Exception as e: error_msg = f"查找镜像时发生意外错误: {e}"; print(error_msg); return None, error_msg
 
 def generate_random_password(length=16):
     characters = string.ascii_letters + string.digits + "!@#$%^&*()_+=-`~[]{};:,.<>?"; password = ''.join(secrets.choice(characters) for i in range(length)); return password
@@ -137,69 +170,33 @@ runcmd:
 """
     return base64.b64encode(cloud_config.encode('utf-8')).decode('utf-8')
 
-# **** CORRECTED: Call to find_image updated, Removed default comp/ad lookup ****
 def backend_create_instance(compute_client, identity_client, details):
-    """ Backend logic for creating an instance using defaults and simplified inputs """
     try:
-        # 1. Determine necessary OCIDs and values using defaults or lookups
         profile_defaults = details['profile_defaults']; tenancy_ocid = profile_defaults['tenancy']
-
-        # Compartment: ALWAYS use tenancy OCID now
-        compartment_id = tenancy_ocid; print(f"使用区间 OCID: {compartment_id}")
-
-        # AD: ALWAYS query and use first
-        print("自动查找可用域...")
-        ads, error = [], None
-        try:
-            list_ads_response = oci.pagination.list_call_get_all_results(identity_client.list_availability_domains, compartment_id=tenancy_ocid); ads = list_ads_response.data
-        except Exception as ad_err:
-            error = f"无法列出可用域: {ad_err}"
-        if error or not ads:
-             return False, error or "无法自动确定可用域。"
+        compartment_id = tenancy_ocid; print(f"使用区间 OCID: {compartment_id}") # Always use tenancy
+        print("自动查找可用域..."); ads, error = [], None
+        try: list_ads_response = oci.pagination.list_call_get_all_results(identity_client.list_availability_domains, compartment_id=tenancy_ocid); ads = list_ads_response.data
+        except Exception as ad_err: error = f"无法列出可用域: {ad_err}"
+        if error or not ads: return False, error or "无法自动确定可用域。"
         ad_name = ads[0].name; print(f"自动选择第一个可用域: {ad_name}")
-
-        # Subnet: Must exist in defaults
         subnet_id = profile_defaults.get('default_subnet_ocid')
         if not subnet_id: return False, "账号配置中缺少必需的 'default_subnet_ocid'。" ; print(f"使用默认子网 OCID: {subnet_id}")
-        # SSH Key: Must exist in defaults
         ssh_key = profile_defaults.get('default_ssh_public_key')
         if not ssh_key: return False, "账号配置中缺少必需的 'default_ssh_public_key'。"; print(f"使用默认 SSH 公钥。")
-
-        # Image: Find based on dialog choices using the corrected function call
-        # **** CORRECTED CALL: Pass only required args ****
-        image_ocid, error = backend_find_image_ocid(compute_client, details['os_name'], details['os_version'], details['shape'])
-        if error or not image_ocid:
-            return False, f"查找镜像失败: {error}" # Pass specific error message back
+        image_ocid, error = backend_find_image_ocid(compute_client, details['os_name'], details['os_version'], details['shape']) # Correct call signature
+        if error or not image_ocid: return False, f"查找镜像失败: {error}"
         print(f"使用镜像 OCID: {image_ocid}")
-
-        # Password and Cloud-init
         root_password = generate_random_password(); user_data_encoded = generate_cloud_init_userdata(root_password); print("已生成随机 Root 密码并通过 cloud-init 设置。")
-
-        # Get base name for initial launch_details construction
         base_name_for_init = details.get('display_name_prefix', 'Instance')
-
-        # 2. Construct Initial Launch Details
-        launch_details = oci.core.models.LaunchInstanceDetails(
-            compartment_id=compartment_id,
-            availability_domain=ad_name,
-            shape=details['shape'],
-            display_name=base_name_for_init, # Use base name initially
-            create_vnic_details=oci.core.models.CreateVnicDetails(subnet_id=subnet_id, assign_public_ip=True),
-            metadata={"ssh_authorized_keys": ssh_key, "user_data": user_data_encoded},
-            source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=image_ocid, boot_volume_size_in_gbs=details['boot_volume_size']),
-            shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=details.get('ocpus'), memory_in_gbs=details.get('memory_in_gbs')) if details.get('ocpus') or details.get('memory_in_gbs') else None)
-
-        # 3. Launch Instance(s) - Loop for count
+        launch_details = oci.core.models.LaunchInstanceDetails( compartment_id=compartment_id, availability_domain=ad_name, shape=details['shape'], display_name=base_name_for_init, create_vnic_details=oci.core.models.CreateVnicDetails(subnet_id=subnet_id, assign_public_ip=True), metadata={"ssh_authorized_keys": ssh_key, "user_data": user_data_encoded}, source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=image_ocid, boot_volume_size_in_gbs=details['boot_volume_size']), shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=details.get('ocpus'), memory_in_gbs=details.get('memory_in_gbs')) if details.get('ocpus') or details.get('memory_in_gbs') else None)
         created_instances_info = []; base_name = details.get('display_name_prefix', 'Instance'); instance_count = details.get('instance_count', 1); all_success = True; error_messages = []
         for i in range(instance_count):
-            instance_name = f"{base_name}-{i+1}" if instance_count > 1 else base_name; launch_details.display_name = instance_name # Set final name per instance
+            instance_name = f"{base_name}-{i+1}" if instance_count > 1 else base_name; launch_details.display_name = instance_name
             print(f"尝试创建实例 {i+1}/{instance_count}: {instance_name}")
             try: launch_response = compute_client.launch_instance(launch_details); instance_ocid = launch_response.data.id; print(f"  -> 请求已发送。OCID: {instance_ocid}"); created_instances_info.append({"name": instance_name, "ocid": instance_ocid});
             except oci.exceptions.ServiceError as e: all_success = False; error_msg = f"创建 '{instance_name}' 失败: {e.status} {e.code} - {e.message}"; error_messages.append(error_msg); print(f"  -> 失败: {error_msg}"); break
             except Exception as e: all_success = False; error_msg = f"创建 '{instance_name}' 意外错误: {e}"; error_messages.append(error_msg); print(f"  -> 失败: {error_msg}"); break
             if i < instance_count - 1: time.sleep(2)
-
-        # 4. Prepare result message
         if created_instances_info:
             success_msg = "实例创建请求已发送:\n" + "\n".join([f"- {info['name']} (OCID: ...{info['ocid'][-12:]})" for info in created_instances_info])
             success_msg += f"\n\n*** 重要: 请立即保存以下生成的 Root 密码！ ***\n\nRoot 密码: {root_password}\n"
@@ -208,19 +205,16 @@ def backend_create_instance(compute_client, identity_client, details):
         else:
             if not error_messages: error_messages.append("未知错误导致无法创建任何实例。")
             return False, "所有实例创建均失败:\n" + "\n".join(error_messages)
-
-    except Exception as e:
-        error_msg = f"创建实例准备阶段出错: {e}"
-        print(error_msg)
-        return False, error_msg
+    except Exception as e: error_msg = f"创建实例准备阶段出错: {e}"; print(error_msg); return False, error_msg
 # --- End Backend Functions ---
 
 
 # --- Dialog Classes ---
 # ImportDialog (Corrected - Removed Optional Fields)
 class ImportDialog(tk.Toplevel):
+     # ...(Same as previous version)...
      def __init__(self, parent, original_profiles_from_ini, existing_aliases_in_use, callback):
-        super().__init__(parent); self.transient(parent); self.title("导入档案并设置别名/默认值"); self.geometry("1000x350"); # Adjusted height
+        super().__init__(parent); self.transient(parent); self.title("导入档案并设置别名/默认值"); self.geometry("650x400"); # Adjusted height
         self.original_profiles = original_profiles_from_ini; self.existing_aliases_in_use = set(existing_aliases_in_use); self.callback = callback; self.profile_widgets = {}
         canvas = tk.Canvas(self); canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True); scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview); scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         content_frame = ttk.Frame(canvas, padding="10"); content_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))); canvas.create_window((0, 0), window=content_frame, anchor="nw"); canvas.configure(yscrollcommand=scrollbar.set)
@@ -233,14 +227,12 @@ class ImportDialog(tk.Toplevel):
             ttk.Label(content_frame, text="设置别名*:").grid(row=row_idx, column=2, padx=5, pady=3, sticky='e'); alias_entry = ttk.Entry(content_frame, width=30); alias_entry.insert(0, profile); widgets['alias_entry'] = alias_entry; alias_entry.grid(row=row_idx, column=3, padx=5, pady=3, sticky='w'); row_idx += 1
             ttk.Label(content_frame, text="默认子网 OCID*:").grid(row=row_idx, column=0, columnspan=2, padx=5, pady=3, sticky='e'); subnet_entry = ttk.Entry(content_frame, width=50); widgets['subnet_entry'] = subnet_entry; subnet_entry.grid(row=row_idx, column=2, columnspan=2, padx=5, pady=3, sticky='w'); row_idx += 1
             ttk.Label(content_frame, text="默认SSH公钥*:").grid(row=row_idx, column=0, columnspan=2, padx=5, pady=3, sticky='e'); ssh_entry = ttk.Entry(content_frame, width=50); widgets['ssh_entry'] = ssh_entry; ssh_entry.grid(row=row_idx, column=2, columnspan=2, padx=5, pady=3, sticky='w'); row_idx += 1
-            # Removed Optional Default Fields (Compartment, AD)
             self.profile_widgets[profile] = widgets
         ttk.Label(content_frame, text="* 为使用简化版'创建实例'功能，'设置别名'、'默认子网 OCID' 和 '默认SSH公钥' 是必需的。", foreground="blue").grid(row=row_idx, column=0, columnspan=4, pady=(10, 5), sticky='w'); row_idx += 1
         button_frame = ttk.Frame(content_frame); button_frame.grid(row=row_idx, column=0, columnspan=4, pady=(15, 0))
         import_button = ttk.Button(button_frame, text="导入选中档案", command=self.import_selected); import_button.pack(side="left", padx=10)
         cancel_button = ttk.Button(button_frame, text="取消", command=self.destroy); cancel_button.pack(side="left", padx=10)
         self.grab_set(); self.wait_window()
-
      def import_selected(self):
         profiles_to_import_full_data = {}; aliases_in_use_this_dialog = set(); has_duplicate = False; missing_required_defaults = []; existing_aliases_in_app = set(self.existing_aliases_in_use)
         for original_name, widgets in self.profile_widgets.items():
@@ -249,7 +241,7 @@ class ImportDialog(tk.Toplevel):
                 if alias in aliases_in_use_this_dialog: messagebox.showwarning("别名重复", f"别名 '{alias}' 在本次导入中被多次使用。", parent=self); has_duplicate = True; break
                 aliases_in_use_this_dialog.add(alias)
                 if not subnet or not ssh_key: missing_required_defaults.append(alias)
-                profiles_to_import_full_data[alias] = { "original_name": original_name, "defaults": { "default_subnet_ocid": subnet or None, "default_ssh_public_key": ssh_key or None } } # Removed other defaults
+                profiles_to_import_full_data[alias] = { "original_name": original_name, "defaults": { "default_subnet_ocid": subnet or None, "default_ssh_public_key": ssh_key or None } }
         if has_duplicate: return
         if missing_required_defaults:
             if not messagebox.askyesno("缺少默认值", f"以下别名缺少必要的默认子网或SSH公钥，将无法使用简化创建功能:\n - {', '.join(missing_required_defaults)}\n\n仍要导入吗 (后续可编辑补充)?", parent=self):
@@ -267,61 +259,42 @@ class ImportDialog(tk.Toplevel):
 class EditProfileDialog(tk.Toplevel):
      def __init__(self, parent, alias, profile_data, vnet_client, callback):
          super().__init__(parent); self.transient(parent); self.title(f"编辑账号: {alias}");
-         # **** CORRECTED: Adjusted height, allow resizing ****
-         self.geometry("840x435"); # Adjusted height after removing fields
+         self.geometry("700x500"); # Adjusted height
          self.resizable(True, True)
          self.profile_data_original = profile_data.copy(); self.alias_original = alias; self.callback = callback
          self.vnet_client = vnet_client; self.entries = {}; self.subnets_map = {};
          self.selected_subnet_ocid_var = tk.StringVar()
-
          canvas = tk.Canvas(self); scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
          scrollbar.pack(side=tk.RIGHT, fill=tk.Y); canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
          content_frame = ttk.Frame(canvas, padding="10"); content_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
          canvas.create_window((0, 0), window=content_frame, anchor="nw"); canvas.configure(yscrollcommand=scrollbar.set)
-
          ttk.Label(content_frame, text=f"编辑账号配置和默认值 (别名: {alias})").grid(row=0, column=0, columnspan=3, pady=(0, 10), sticky='w')
-
-         # Fields definition corrected based on feedback (removed compartment/AD defaults)
          fields = [ ('user', 'User OCID*:', 60, True), ('fingerprint', '指纹*:', 60, True), ('tenancy', 'Tenancy OCID*:', 60, True), ('region', '区域*:', 30, True), ('key_file', '密钥文件路径*:', 50, True), ('passphrase', '密钥密码(可选):', 30, False) ]
          row_idx = 1
          for key, label, width, req_conn in fields:
              ttk.Label(content_frame, text=label).grid(row=row_idx, column=0, sticky=tk.E, padx=5, pady=3)
              entry = ttk.Entry(content_frame, width=width); entry.insert(0, self.profile_data_original.get(key) or ""); entry.grid(row=row_idx, column=1, sticky=tk.EW, padx=5, pady=3); self.entries[key] = entry
              if key == 'key_file': browse = ttk.Button(content_frame, text="浏览...", command=lambda e=entry: self.browse_edit_key(e)); browse.grid(row=row_idx, column=2, padx=5, sticky='w')
-             # Only bind subnet refresh to tenancy now
-             if key == 'tenancy':
-                  entry.bind("<FocusOut>", lambda e, k=key: self.load_subnets_for_edit())
-                  entry.bind("<Return>", lambda e, k=key: self.load_subnets_for_edit())
+             if key == 'tenancy': entry.bind("<FocusOut>", lambda e, k=key: self.load_subnets_for_edit()); entry.bind("<Return>", lambda e, k=key: self.load_subnets_for_edit())
              row_idx += 1
-
-         # --- Default Subnet ---
          ttk.Label(content_frame, text="默认子网 OCID**:").grid(row=row_idx, column=0, sticky=tk.E, padx=5, pady=3)
          self.subnet_combobox = ttk.Combobox(content_frame, textvariable=self.selected_subnet_ocid_var, state='disabled', width=48, values=[" "]);
          self.subnet_combobox.grid(row=row_idx, column=1, sticky=tk.EW, padx=5, pady=3)
          self.load_subnet_button = ttk.Button(content_frame, text="加载/刷新子网", command=self.load_subnets_for_edit);
          self.load_subnet_button.grid(row=row_idx, column=2, padx=5, sticky='w')
-         self.entries["default_subnet_ocid"] = self.selected_subnet_ocid_var # Store var
+         self.entries["default_subnet_ocid"] = self.selected_subnet_ocid_var
          row_idx += 1
-
-         # --- SSH Key ---
          ttk.Label(content_frame, text="默认SSH公钥**:").grid(row=row_idx, column=0, sticky=tk.NE, padx=5, pady=3)
          self.ssh_key_text = scrolledtext.ScrolledText(content_frame, width=60, height=5, wrap=tk.WORD); self.ssh_key_text.insert("1.0", self.profile_data_original.get("default_ssh_public_key") or ""); self.ssh_key_text.grid(row=row_idx, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=3); self.entries["default_ssh_public_key"] = self.ssh_key_text; row_idx +=1
-
-         # --- Notes ---
          ttk.Label(content_frame, text="* OCI连接必需字段.", foreground="gray").grid(row=row_idx, column=1, columnspan=2, sticky='w', padx=5, pady=2); row_idx += 1
          ttk.Label(content_frame, text="** 使用简化'创建实例'功能必需字段.", foreground="blue").grid(row=row_idx, column=1, columnspan=2, sticky='w', padx=5, pady=2); row_idx += 1
-
-         # --- Buttons ---
          button_frame = ttk.Frame(content_frame); button_frame.grid(row=row_idx, column=0, columnspan=3, pady=(15, 5))
          save_button = ttk.Button(button_frame, text="保存更改", command=self.save_changes); save_button.pack(side="left", padx=10)
          cancel_button = ttk.Button(button_frame, text="取消", command=self.destroy); cancel_button.pack(side="left", padx=10)
-
          content_frame.columnconfigure(1, weight=1)
          if self.vnet_client: self.load_subnets_for_edit(initial=True)
          else: self.subnet_combobox.config(values=["需先连接才能加载"], state='disabled'); self.load_subnet_button.config(state='disabled')
          self.grab_set(); self.wait_window()
-
-     # ...(browse_edit_key, load_subnets_for_edit, load_subnets_backend methods are same)...
      def browse_edit_key(self, entry_widget):
         filepath = filedialog.askopenfilename(title="选择私钥文件", filetypes=(("PEM files", "*.pem"), ("All files", "*.*")))
         if filepath: entry_widget.delete(0, tk.END); entry_widget.insert(0, filepath)
@@ -329,7 +302,6 @@ class EditProfileDialog(tk.Toplevel):
         if not self.vnet_client:
              if not initial: messagebox.showwarning("未连接", "请先在主窗口连接此账号，才能加载子网列表。", parent=self)
              return
-        # **** CORRECTED: Always use tenancy to load subnets as default comp is removed ****
         comp_ocid = self.entries['tenancy'].get().strip()
         if not comp_ocid:
              if not initial: messagebox.showwarning("缺少信息", "请输入 Tenancy OCID 以加载子网。", parent=self)
@@ -338,7 +310,6 @@ class EditProfileDialog(tk.Toplevel):
         self.subnet_combobox.config(values=["正在加载..."], state='disabled'); self.selected_subnet_ocid_var.set("正在加载...")
         thread = threading.Thread(target=self.load_subnets_backend, args=(comp_ocid, initial), daemon=True); thread.start()
      def load_subnets_backend(self, compartment_id, initial):
-        # ...(Same logic, just ensure root.after is used)...
         subnets, error = backend_list_subnets(self.vnet_client, compartment_id); subnet_display_list = []; self.subnets_map.clear(); cb_state='disabled'; selected_val=''
         if error:
             if not initial: self.after(0, lambda: messagebox.showerror("获取子网错误", error, parent=self))
@@ -356,22 +327,17 @@ class EditProfileDialog(tk.Toplevel):
             if not initial: self.after(0, lambda: messagebox.showinfo("无子网", f"在区间 '{compartment_id}' 中未找到可用子网。", parent=self))
         self.after(0, lambda: self.subnet_combobox.config(values=sorted(subnet_display_list), state=cb_state))
         self.after(0, lambda: self.selected_subnet_ocid_var.set(selected_val))
-
      def save_changes(self):
-         # ...(Logic updated to reflect removed fields)...
          updated_data = {}
          for key, widget in self.entries.items():
              if key == "default_subnet_ocid": display_value = widget.get(); updated_data[key] = self.subnets_map.get(display_value)
              elif key == "default_ssh_public_key": value = widget.get("1.0", tk.END).strip(); updated_data[key] = value if value else None
-             # Skip removed keys explicitly if they somehow exist in self.entries (shouldn't)
-             elif key not in ["default_compartment_ocid", "default_ad_name", "default_os", "default_os_version"]:
+             elif key not in ["default_compartment_ocid", "default_ad_name"]: # Exclude removed keys
                  value = widget.get().strip(); updated_data[key] = value if value else None
          required_keys = ['user', 'fingerprint', 'tenancy', 'region', 'key_file']
          missing = [k for k in required_keys if not updated_data.get(k)]
          if missing: messagebox.showerror("缺少信息", f"必需字段 ({', '.join(missing)}) 不能为空。", parent=self); return
-         # Ensure removed keys are not in the final dict
-         updated_data.pop("default_compartment_ocid", None); updated_data.pop("default_ad_name", None)
-         updated_data.pop("default_os", None); updated_data.pop("default_os_version", None)
+         updated_data.pop("default_compartment_ocid", None); updated_data.pop("default_ad_name", None) # Ensure removed keys are gone
          if self.callback: self.callback(self.alias_original, updated_data)
          self.destroy()
 
@@ -601,7 +567,7 @@ class OciInstanceManagerApp:
         if selected_alias not in self.all_profiles_data: messagebox.showerror("错误", f"找不到别名 '{selected_alias}' 数据。"); return
         if messagebox.askyesno("确认删除", f"确定删除账号配置 '{selected_alias}' 吗？", icon='warning'):
             del self.all_profiles_data[selected_alias]; self.save_profiles_to_file(); self.update_combobox_from_profiles()
-            self.update_status(f"账号 '{selected_alias}' 已删除。"); messagebox.showinfo("删除成功", f"账号 '{selected_alias}' 已删除。")
+            self.update_status(f"账号 '{selected_alias}' 已删除。"); messagebox.showinfo("删除成功", f"账号 '{selected_alias}' 已被删除。")
 
     def on_profile_selected(self, event=None):
         # ...(Updates button states)...
@@ -676,32 +642,63 @@ class OciInstanceManagerApp:
         if is_valid_selection: self.selected_instance_ocid = selected_items[0]
         else: self.selected_instance_ocid = None
         self.toggle_controls(connected=self.is_connected, profiles_exist=bool(self.all_profiles_data), selection_valid=is_valid_selection)
+
+    # **** CORRECTED: Use action_type instead of action_name ****
     def confirm_and_run_action(self, action_type):
         if not self.selected_instance_ocid: messagebox.showwarning("未选择", "请选择实例。"); return
         if self.selected_instance_ocid not in self.instance_data: messagebox.showerror("错误", "实例数据丢失。"); return
-        details = self.instance_data[self.selected_instance_ocid]; instance_name = details["display_name"]; vnic_id = details["vnic_id"]
+
+        details = self.instance_data[self.selected_instance_ocid]
+        instance_name = details["display_name"]
+        vnic_id = details["vnic_id"]
         confirm_message, backend_function, args, requires_confirmation = "", None, [], True
+
+        # --- Action specific logic ---
         if action_type == "change_ip":
-             if not vnic_id: messagebox.showerror("错误", f"实例 '{instance_name}' 未找到 VNIC ID。"); return
-             confirm_message = f"确定更换实例 '{instance_name}' 的公网 IP 吗？\n(需要 'manage vnics' 权限)"; backend_function, args = backend_change_public_ip, [self.virtual_network_client, vnic_id]
+             if not vnic_id:
+                 messagebox.showerror("错误", f"实例 '{instance_name}' 未找到 VNIC ID，无法更换 IP。"); return
+             confirm_message = f"确定更换实例 '{instance_name}' 的公网 IP 吗？\n(将尝试删除旧IP并创建新IP，需要 'manage public-ips' 等权限)"
+             # Get compartment_id (using tenancy) needed by the new backend function
+             compartment_id_for_pubip = self.oci_config.get("tenancy") if self.oci_config else None
+             if not compartment_id_for_pubip:
+                 messagebox.showerror("错误", "无法获取当前账号的 Tenancy OCID 以执行操作。")
+                 return
+             # Args for backend: vnet_client, vnic_id, compartment_id
+             backend_function = backend_change_public_ip
+             args = [self.virtual_network_client, vnic_id, compartment_id_for_pubip] # Correct 3 args
+
         elif action_type == "restart":
-             confirm_message = f"确定重启实例 '{instance_name}' 吗？\n(需要 'manage instance-family' 权限)"; backend_function, args = backend_restart_instance, [self.compute_client, self.selected_instance_ocid]
+             confirm_message = f"确定重启实例 '{instance_name}' 吗？\n(需要 'manage instance-family' 权限)";
+             # Args for backend: compute_client, instance_id
+             backend_function, args = backend_restart_instance, [self.compute_client, self.selected_instance_ocid]
+
         elif action_type == "terminate":
              confirm1 = messagebox.askyesno("终止确认", f"!!! 警告: 终止实例 '{instance_name}' 无法撤销 !!!\n\n确定继续吗？ (需要 'manage instance-family' 权限)", icon='warning');
              if not confirm1: self.update_status("终止操作已取消。"); return
              preserve_boot = messagebox.askyesno("保留启动卷?", f"终止实例 '{instance_name}' 时是否保留启动卷？", default=messagebox.NO)
              confirm2 = messagebox.askyesno("最终确认", f"最终确认终止实例 '{instance_name}' (保留启动卷: {'是' if preserve_boot else '否'}) 吗？", icon='error');
              if not confirm2: self.update_status("终止操作已取消。"); return
+             # Args for backend: compute_client, instance_id, preserve_boot_volume
              requires_confirmation, backend_function, args = False, backend_terminate_instance, [self.compute_client, self.selected_instance_ocid, preserve_boot]
-        else: return
-        if requires_confirmation and not messagebox.askyesno("确认操作", confirm_message): self.update_status(f"操作 '{action_type}' 已取消。"); return
+        else:
+             return # Should not happen
+
+        # --- Confirmation and Execution ---
+        if requires_confirmation and not messagebox.askyesno("确认操作", confirm_message):
+             self.update_status(f"操作 '{action_type}' 已取消。"); return
+
         self.update_status(f"正在执行 '{action_type}' 操作...");
-        self.toggle_controls(connected=True, profiles_exist=bool(self.all_profiles_data), selection_valid=False); self.refresh_button.config(state='disabled'); self.create_instance_button.config(state='disabled')
-        thread = threading.Thread(target=self.run_backend_action, args=(backend_function, args, action_name), daemon=True); thread.start()
-    def run_backend_action(self, backend_func, func_args, action_name):
+        self.toggle_controls(connected=True, profiles_exist=bool(self.all_profiles_data), selection_valid=False);
+        self.refresh_button.config(state='disabled'); self.create_instance_button.config(state='disabled')
+        # Start background thread with correct args (backend_func, args list, action_type string)
+        thread = threading.Thread(target=self.run_backend_action, args=(backend_function, args, action_type), daemon=True);
+        thread.start()
+    def run_backend_action(self, backend_func, func_args, action_name): # parameter name here is fine, it receives action_type
         try: success, message = backend_func(*func_args); self.root.after(0, self.update_gui_after_action, success, message, action_name)
         except Exception as e: error_msg = f"执行 '{action_name}' 时内部错误: {e}"; self.root.after(0, self.update_gui_after_action, False, error_msg, action_name)
-    def update_gui_after_action(self, success, message, action_name):
+
+    # **** CORRECTED: Use correct variable action_name from parameter ****
+    def update_gui_after_action(self, success, message, action_name): # parameter name here is fine
         is_selection_still_valid = self.selected_instance_ocid in self.instance_data and self.instance_treeview.exists(self.selected_instance_ocid)
         if success:
             self.update_status(f"操作 '{action_name}' 成功: {message}"); messagebox.showinfo("操作成功", message)
