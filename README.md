@@ -1,3 +1,4 @@
+![应用界面截图](ui.jpg)
 # OCI 实例图形管理器 (OCI Instance Manager GUI)
 
 一个使用 Python 和 Tkinter 编写的、用于管理 Oracle Cloud Infrastructure (OCI) 计算实例的纯本地化简单图形界面工具，支持多账号管理。
