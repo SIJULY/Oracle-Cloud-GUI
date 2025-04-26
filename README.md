@@ -70,3 +70,6 @@ python oci-instance-manager-gui.py # 或者你实际的脚本文件名
 ## 许可证 (License)
 
 本项目采用 MIT 许可证授权。
+
+![telegram-cloud-photo-size-1-4927483943272426777-y](https://github.com/user-attachments/assets/75827b0b-5bde-4ac3-a451-4d08da9ca0e1)
+
