@@ -1206,7 +1206,7 @@ class OciInstanceManagerApp:
                 if hasattr(self, 'edit_profile_button'): self.edit_profile_button.config(state=edit_delete_state)
                 if hasattr(self, 'delete_profile_button'): self.delete_profile_button.config(state=edit_delete_state)
                 if hasattr(self, 'profiles_combobox'): self.profiles_combobox.config(state='readonly' if profiles_exist else 'disabled')
-                if hasattr(self, 'connect_button'): self.connect_button.config(state='normal' if profiles_exist and not connected else 'disabled')
+                if hasattr(self, 'connect_button'): self.connect_button.config(state='normal' if profiles_exist else 'disabled')
 
                 # General action controls
                 refresh_state = 'normal' if connected else 'disabled'
@@ -1474,20 +1474,39 @@ class OciInstanceManagerApp:
 
     # --- Connection Logic ---
     def connect_oci_thread(self):
-        # Ensure correct indentation (Level 1 within class)
         selected_alias = self.profile_alias_var.get()
-        if not selected_alias: messagebox.showwarning("未选择账号", "请选择要连接的账号。"); return
+        if not selected_alias: messagebox.showwarning("未选择账号", "请选择要连接的账号。", parent=self.root); return
         profile_config = self.all_profiles_data.get(selected_alias)
-        if not profile_config: self.log_ui(f"尝试连接但找不到别名 '{selected_alias}' 的配置数据。", level='ERROR'); messagebox.showerror("错误", f"找不到别名 '{selected_alias}' 的配置数据。"); return
-        # Disable controls immediately
+        if not profile_config: self.log_ui(f"尝试连接但找不到别名 '{selected_alias}' 的配置数据。", level='ERROR'); messagebox.showerror("错误", f"找不到别名 '{selected_alias}' 的配置数据。", parent=self.root); return
+
+        # --- 添加切换账号逻辑 ---
+        if self.is_connected:
+            if selected_alias == self.connected_profile_alias:
+                # 如果选中的就是当前已连接的账号，可以不做任何事或给个提示
+                self.log_ui(f"已经连接到账号 '{selected_alias}'。", level='INFO')
+                messagebox.showinfo("提示", f"当前已经连接到账号 '{selected_alias}'。", parent=self.root)
+                return # 阻止重新连接同一个账号
+            else:
+                # 如果选中的是不同的账号，先断开当前连接
+                self.log_ui(f"检测到已连接账号 '{self.connected_profile_alias}'，将先断开以切换到 '{selected_alias}'...", level='INFO')
+                self.disconnect_oci()
+                # 短暂等待UI状态更新可能更稳定，但disconnect_oci内部已调用toggle_controls
+                # self.root.update_idletasks() # 可以尝试加这句强制更新
+                # time.sleep(0.1) # 或者短暂sleep
+        # --- 结束添加切换账号逻辑 ---
+
+        # --- 继续原来的连接流程 ---
+        # 禁用连接相关控件 (因为即将开始新的连接)
         if hasattr(self,'connect_button'): self.connect_button.config(state='disabled')
         if hasattr(self,'profiles_combobox'): self.profiles_combobox.config(state='disabled')
         if hasattr(self,'add_profile_button'): self.add_profile_button.config(state='disabled')
         if hasattr(self,'edit_profile_button'): self.edit_profile_button.config(state='disabled')
         if hasattr(self,'delete_profile_button'): self.delete_profile_button.config(state='disabled')
         self.log_ui(f"正在连接账号 '{selected_alias}' ...", level='INFO')
-        thread = threading.Thread(target=self.connect_oci_backend, args=(profile_config, selected_alias), daemon=True); thread.start()
 
+        # 启动后台线程进行连接
+        thread = threading.Thread(target=self.connect_oci_backend, args=(profile_config, selected_alias), daemon=True)
+        thread.start()
     def connect_oci_backend(self, profile_config, selected_alias):
         # Ensure correct indentation (Level 1 within class)
         profiles_exist = bool(self.all_profiles_data)
