@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-# OCI管理工具 - 功能整合版 (v16.3 - 集成默认公钥)
+# OCI管理工具 - 终极完整版 (v16.8 - 路径回退 + 导入导出功能)
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import tkinter.font as tkfont
+from datetime import datetime, timezone
 import oci
 from oci.core.models import (CreateVcnDetails, CreateSubnetDetails, CreateInternetGatewayDetails,
                              UpdateRouteTableDetails, RouteRule, CreatePublicIpDetails, CreateIpv6Details,
@@ -23,39 +24,32 @@ import base64
 import logging
 import tempfile
 import requests
+import re
+from pypinyin import lazy_pinyin
 
+# --- 路径设置：回归 ~/.oci_manager_config (最稳妥方案) ---
+USER_HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(USER_HOME, ".oci_manager_config")
 
-# --- ✨ 新增: 兼容打包环境的路径辅助函数 ---
-def resource_path(relative_path):
-    """ 获取资源的绝对路径，兼容开发模式和 PyInstaller 打包后的应用 """
-    # 判断是否被 PyInstaller 打包
-    if hasattr(sys, 'frozen'):
-        # 如果是打包状态，基础路径是可执行文件所在的目录
-        # sys.executable 是指向可执行文件的绝对路径
-        base_path = os.path.dirname(sys.executable)
-        # 在 macOS 的 .app 包中，可执行文件位于 Contents/MacOS 内
-        # 我们需要返回上一级目录，再上一级，才是 .app 文件所在的目录
-        if sys.platform == 'darwin' and '.app' in base_path:
-            base_path = os.path.abspath(os.path.join(base_path, '..', '..', '..'))
-    else:
-        # 如果是开发模式（直接运行 .py），基础路径就是脚本文件所在的目录
-        base_path = os.path.dirname(os.path.abspath(__file__))
+# 确保目录存在
+if not os.path.exists(CONFIG_DIR):
+    try:
+        os.makedirs(CONFIG_DIR)
+    except Exception:
+        pass
 
-    return os.path.join(base_path, relative_path)
-
-
-# --- ✨ 修改: 使用新的辅助函数定义所有文件路径 ---
+    # --- 文件路径定义 ---
 PROFILES_FILENAME = "oci_profiles.json"
 SETTINGS_FILENAME = "oci_gui_settings.json"
 LOG_FILENAME = "oci_gui_manager.log"
 CLOUDFLARE_CONFIG_FILENAME = "cloudflare_settings.json"
 
-PROFILES_FILE_PATH = resource_path(PROFILES_FILENAME)
-SETTINGS_FILE_PATH = resource_path(SETTINGS_FILENAME)
-LOG_FILE_PATH = resource_path(LOG_FILENAME)
-CLOUDFLARE_CONFIG_FILE_PATH = resource_path(CLOUDFLARE_CONFIG_FILENAME)
+PROFILES_FILE_PATH = os.path.join(CONFIG_DIR, PROFILES_FILENAME)
+SETTINGS_FILE_PATH = os.path.join(CONFIG_DIR, SETTINGS_FILENAME)
+LOG_FILE_PATH = os.path.join(CONFIG_DIR, LOG_FILENAME)
+CLOUDFLARE_CONFIG_FILE_PATH = os.path.join(CONFIG_DIR, CLOUDFLARE_CONFIG_FILENAME)
 
-# --- ✅ 新增: 默认SSH公钥 ---
+# --- 默认SSH公钥 ---
 DEFAULT_SSH_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDuxGi8wfpz+Us1flHLhTFErH0MkejwK68vMomuW1toccSBTl0VK/aTV7zn2KB6B0rWc6cZoK6m02ZW8dieTa4x0CBDl7FxlyqJhOlfyIWJ7/qh3NlEFJ5l/17KeugUYSJxck9rKMsyZgjrPoWQub48CQLFgqxwDNUavAGeJIkxELDTIxPJQNpZOBrAGcQeWNAfwznwOME7lbXPQhPlI26O7gFRA1+9zekwxy3x8/axrr9ygzOLAMgGsK3tM/NF4QHTivrH8Gj8QpkSEVTTEIE2SV2varAgzP3vwwogQ7OSiIW5rr2pdkX9/ZTcVaV9qEDL+GOhcOCkDMbqsF/d/7vt ssh-key-2025-09-27"
 
 # --- 日志设置 ---
@@ -67,7 +61,6 @@ logging.basicConfig(level=logging.INFO,
 
 # --- 辅助函数 ---
 def center_window(window):
-    """窗口居中"""
     window.update_idletasks()
     width = window.winfo_width()
     height = window.winfo_height()
@@ -79,7 +72,6 @@ def center_window(window):
 
 
 def get_user_data(password, startup_script=None):
-    """生成cloud-init脚本，包含默认依赖安装、密码设置和可选的用户自定义脚本"""
     default_script = """
 echo "Waiting for apt lock to be released..."
 while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do
@@ -94,7 +86,6 @@ for i in 1 2 3; do
   sleep 15
 done
 """
-
     script_parts = [
         "#cloud-config",
         "chpasswd:",
@@ -107,12 +98,9 @@ done
         "  - \"sed -i -e '/^#*PermitRootLogin/s/^.*$/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config\"",
         f"  - [ bash, -c, {json.dumps(default_script)} ]",
     ]
-
     if startup_script and startup_script.strip():
         script_parts.append(f"  - [ bash, -c, {json.dumps(startup_script.strip())} ]")
-
     script_parts.append("  - systemctl restart sshd || service sshd restart || service ssh restart")
-
     script = "\n".join(script_parts)
     return base64.b64encode(script.encode('utf-8')).decode('utf-8')
 
@@ -213,11 +201,20 @@ def get_detailed_instances(compute_client, virtual_network_client, block_storage
                                                              compartment_id=compartment_id).data
         if not instances: return [], "在指定区间未找到实例。"
         for instance in instances:
+            duration_str = "N/A"
+            if instance.time_created:
+                try:
+                    diff = datetime.now(timezone.utc) - instance.time_created
+                    duration_str = f"{diff.days}天 {diff.seconds // 3600}小时"
+                except:
+                    pass
+
             instance_data = {"display_name": instance.display_name, "id": instance.id,
                              "lifecycle_state": instance.lifecycle_state, "region": instance.region,
                              "availability_domain": instance.availability_domain, "shape": instance.shape,
                              "time_created": instance.time_created.strftime(
                                  '%Y-%m-%d %H:%M:%S') if instance.time_created else "N/A",
+                             "duration": duration_str,
                              "ocpus": instance.shape_config.ocpus if instance.shape_config else "N/A",
                              "memory_in_gbs": instance.shape_config.memory_in_gbs if instance.shape_config else "N/A",
                              "private_ip": "获取中...", "public_ip": "获取中...", "ipv6_address": "获取中...",
@@ -1024,7 +1021,7 @@ class CloudflareSettingsDialog(tk.Toplevel):
 class OciInstanceManagerApp:
     def __init__(self, root):
         self.root = root;
-        self.root.title("OCI 本地化管理工具 (重置版)");
+        self.root.title("OCI 本地化管理工具 (v16.8 - 完整功能版)");
         self.root.geometry("1500x800");
         self.logger = logging.getLogger(__name__);
         self.logger.info("--- OCI 应用启动 ---");
@@ -1059,7 +1056,7 @@ class OciInstanceManagerApp:
         main_pane.pack(expand=True, fill=tk.BOTH, padx=10, pady=(0, 5));
         left_frame = ttk.Frame(main_pane, padding=(0, 5));
         self.create_account_list_view(left_frame);
-        main_pane.add(left_frame, width=300);
+        main_pane.add(left_frame, width=360);
         right_frame = ttk.Frame(main_pane, padding=(5, 5));
         self.create_instance_view(right_frame);
         main_pane.add(right_frame);
@@ -1067,14 +1064,23 @@ class OciInstanceManagerApp:
         self.create_log_viewer();
         self.create_status_bar();
         self.update_account_list();
-        if not self.all_profiles_data: self.log_ui("未找到账号配置。请使用 '添加账号' 功能开始。", level='WARN')
+        if not self.all_profiles_data: self.log_ui("未找到账号配置。请使用 '导入账号' 或 '添加账号' 功能。", level='WARN')
         self.toggle_controls(connected=False, profiles_exist=bool(self.all_profiles_data), selection_valid=False)
 
+    # 增强JSON读取能力
     def load_profiles_from_file(self):
         try:
             if os.path.exists(PROFILES_FILE_PATH):
                 with open(PROFILES_FILE_PATH, 'r', encoding='utf-8') as f:
-                    self.all_profiles_data = json.load(f)
+                    data = json.load(f)
+                    if "profiles" in data and isinstance(data["profiles"], dict):
+                        self.all_profiles_data = data["profiles"]
+                        self.logger.info("检测到Web端JSON格式，已成功加载 profiles 数据。")
+                        if "profile_order" in data and isinstance(data["profile_order"], list):
+                            self.profile_order = data["profile_order"]
+                            self.logger.info("已从Web端JSON同步 profile_order。")
+                    else:
+                        self.all_profiles_data = data
                 self.logger.info(f"从 {PROFILES_FILE_PATH} 加载了 {len(self.all_profiles_data)} 个账号配置。")
             else:
                 self.all_profiles_data = {}
@@ -1288,12 +1294,26 @@ class OciInstanceManagerApp:
                                            style="Red.TButton")
         self.terminate_button.pack(side=tk.LEFT, padx=2, expand=True, fill=tk.X)
 
+    # --- 账户列表创建，配置排序和颜色Tag ---
     def create_account_list_view(self, parent_frame):
         view_frame = ttk.LabelFrame(parent_frame, text="账户列表", padding=(5, 5));
         view_frame.pack(expand=True, fill=tk.BOTH);
-        self.account_treeview = ttk.Treeview(view_frame, columns=('alias',), show='headings', selectmode='browse');
-        self.account_treeview.heading('alias', text='账号别名');
-        self.account_treeview.column('alias', anchor=tk.W);
+
+        self.account_treeview = ttk.Treeview(view_frame, columns=('alias', 'duration'), show='headings',
+                                             selectmode='browse');
+
+        self.account_treeview.heading('alias', text='账户名称',
+                                      command=lambda: self.sort_account_column('alias', False))
+        self.account_treeview.column('alias', width=100, anchor=tk.CENTER);
+
+        self.account_treeview.heading('duration', text='租户创建时间',
+                                      command=lambda: self.sort_account_column('duration', False))
+        self.account_treeview.column('duration', width=200, anchor=tk.CENTER);
+
+        self.account_treeview.tag_configure("oddrow", background="white")
+        self.account_treeview.tag_configure("evenrow", background="#F2F2F2")
+        self.account_treeview.tag_configure('connected', background='lightblue')
+
         vsb = ttk.Scrollbar(view_frame, orient="vertical", command=self.account_treeview.yview);
         self.account_treeview.configure(yscrollcommand=vsb.set);
         self.account_treeview.grid(row=0, column=0, sticky='nsew');
@@ -1306,6 +1326,71 @@ class OciInstanceManagerApp:
         self.account_treeview.bind("<ButtonPress-1>", self.on_drag_start)
         self.account_treeview.bind("<B1-Motion>", self.on_drag_motion)
         self.account_treeview.bind("<ButtonRelease-1>", self.on_drag_stop)
+
+        # --- 新增: 导入导出按钮区域 ---
+        btn_frame = ttk.Frame(view_frame)
+        btn_frame.grid(row=1, column=0, columnspan=2, sticky='ew', pady=5)
+
+        ttk.Button(btn_frame, text="导入账号", command=self.import_accounts).pack(side=tk.LEFT, expand=True, fill=tk.X,
+                                                                                  padx=2)
+        ttk.Button(btn_frame, text="导出账号", command=self.export_accounts).pack(side=tk.LEFT, expand=True, fill=tk.X,
+                                                                                  padx=2)
+
+    # --- 导入/导出 功能逻辑 ---
+    def import_accounts(self):
+        filepath = filedialog.askopenfilename(title="选择要导入的账号文件", filetypes=[("JSON Files", "*.json")])
+        if not filepath: return
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            new_profiles = {}
+            new_order = []
+
+            # 兼容新旧格式
+            if "profiles" in data:
+                new_profiles = data["profiles"]
+                new_order = data.get("profile_order", [])
+            else:
+                new_profiles = data
+
+            if not new_profiles:
+                messagebox.showwarning("无效文件", "所选文件不包含有效的账号数据。")
+                return
+
+            # 合并数据
+            self.all_profiles_data.update(new_profiles)
+
+            # 合并排序
+            if new_order:
+                existing_order_set = set(self.profile_order)
+                for item in new_order:
+                    if item not in existing_order_set:
+                        self.profile_order.append(item)
+
+            # 保存到本地配置
+            self.save_profiles_to_file()
+            self.save_settings_to_file()
+            self.update_account_list()
+            messagebox.showinfo("导入成功", f"成功导入了 {len(new_profiles)} 个账号配置。")
+        except Exception as e:
+            messagebox.showerror("导入失败", f"文件读取错误: {e}")
+
+    def export_accounts(self):
+        filepath = filedialog.asksaveasfilename(title="导出账号配置", defaultextension=".json",
+                                                filetypes=[("JSON Files", "*.json")],
+                                                initialfile="oci_profiles_backup.json")
+        if not filepath: return
+        try:
+            export_data = {
+                "profiles": self.all_profiles_data,
+                "profile_order": self.profile_order
+            }
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=4, ensure_ascii=False)
+            messagebox.showinfo("导出成功", f"账号配置已成功备份到:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("导出失败", f"无法写入文件: {e}")
 
     def create_instance_view(self, parent_frame):
         instance_pane = tk.PanedWindow(parent_frame, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=5)
@@ -1357,6 +1442,52 @@ class OciInstanceManagerApp:
         self.status_label = ttk.Label(self.root, text="未连接", relief=tk.SUNKEN, anchor=tk.W, padding=(5, 2));
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
+    # --- 排序辅助方法（拼音+数字） ---
+    def get_account_sort_key(self, col, value):
+        """辅助排序：如果是时间列，提取数字；如果是名称列，转拼音排序"""
+        if col == "duration":
+            # 提取 "8天" 中的 "8"
+            match = re.match(r"(\d+)天", value)
+            if match:
+                return int(match.group(1))
+            # 处理 "- (未来)" 或其他格式
+            if "未来" in value: return -1
+            return 999999  # 无日期的排在最后
+        else:
+            # 使用 lazy_pinyin 将 "阿布扎比" 转换为 ['a', 'bu', 'zha', 'bi']
+            if not value:
+                return ""
+            try:
+                # 将汉字转换为拼音字符串 (例如: "阿布扎比" -> "abuzhabi")
+                pinyin_str = "".join(lazy_pinyin(value))
+                return pinyin_str.lower()
+            except Exception:
+                return value.lower()
+
+    def sort_account_column(self, col, reverse):
+        """执行账户列表排序"""
+        l = [(self.account_treeview.set(k, col), k) for k in self.account_treeview.get_children('')]
+        l.sort(key=lambda x: self.get_account_sort_key(col, x[0]), reverse=reverse)
+
+        for index, (val, k) in enumerate(l):
+            self.account_treeview.move(k, '', index)
+
+        # 排序后刷新斑马纹
+        self.refresh_account_colors()
+
+        # 绑定反向排序
+        self.account_treeview.heading(col, command=lambda: self.sort_account_column(col, not reverse))
+
+    def refresh_account_colors(self):
+        """重新计算斑马纹，保持 Connected 高亮"""
+        for i, item_id in enumerate(self.account_treeview.get_children()):
+            if item_id == self.connected_profile_alias:
+                self.account_treeview.item(item_id, tags=('connected',))
+            else:
+                tag = "evenrow" if i % 2 == 0 else "oddrow"
+                self.account_treeview.item(item_id, tags=(tag,))
+
+    # --- 账户列表更新逻辑 (包含新的日期格式与斑马纹) ---
     def update_account_list(self):
         current_selection = self.account_treeview.selection()
 
@@ -1373,14 +1504,40 @@ class OciInstanceManagerApp:
         elif current_selection and current_selection[0] in final_order:
             last_used_item_id = current_selection[0]
 
-        for alias in final_order:
-            self.account_treeview.insert('', tk.END, iid=alias, values=(alias,), tags=('disconnected',))
+        for i, alias in enumerate(final_order):
+            # 获取该账号的 registration_date 并计算时长
+            profile_data = self.all_profiles_data.get(alias, {})
+            reg_date_str = profile_data.get('registration_date')
+            duration_display = ""
+
+            if reg_date_str:
+                try:
+                    reg_date = datetime.strptime(reg_date_str, "%Y-%m-%d").date()
+                    today = datetime.now().date()
+                    delta = today - reg_date
+                    days = delta.days
+                    if days < 0:
+                        duration_display = f"{days}天 (未来)"
+                    else:
+                        duration_display = f"{days}天 ({reg_date.year}年{reg_date.month}月{reg_date.day}日)"
+                except Exception:
+                    duration_display = "格式错误"
+            else:
+                duration_display = "-"
+
+            # --- 设置初始 Tag (斑马纹或已连接状态) ---
+            tags = ()
+            if alias == self.connected_profile_alias:
+                tags = ('connected',)
+            else:
+                tags = ('evenrow',) if i % 2 == 0 else ('oddrow',)
+
+            # 插入数据
+            self.account_treeview.insert('', tk.END, iid=alias, values=(alias, duration_display), tags=tags)
 
         if last_used_item_id:
             self.account_treeview.selection_set(last_used_item_id)
             self.account_treeview.focus(last_used_item_id)
-
-        self.account_treeview.tag_configure('connected', background='lightblue')
 
         if list(self.account_treeview.get_children()) != self.profile_order:
             self.profile_order = list(self.account_treeview.get_children())
@@ -1420,7 +1577,7 @@ class OciInstanceManagerApp:
                 f"  内存(GB):   {details_data.get('memory_in_gbs', 'N/A')}",
                 f"  引导卷:     {details_data.get('boot_volume_size_gb', 'N/A')} GB ({details_data.get('vpus_per_gb', 'N/A')} VPU/GB)",
                 f"可用域:       {details_data.get('availability_domain', 'N/A')}",
-                f"创建时间:     {details_data.get('time_created', 'N/A')}",
+                f"创建时间:     {details_data.get('time_created', 'N/A')} (已运行 {details_data.get('duration', 'N/A')})",
                 f"区域:         {details_data.get('region', 'N/A')}",
                 f"区间 OCID:    {details_data.get('compartment_id', 'N/A')}",
                 "-" * 30,
@@ -1556,78 +1713,143 @@ class OciInstanceManagerApp:
         try:
             sdk_config = profile_config.copy()
 
+            # --- 1. 处理代理配置 ---
             proxy_url = sdk_config.get("proxy", "").strip()
             if not proxy_url:
                 if "proxy" in sdk_config:
                     del sdk_config["proxy"]
             else:
+                # OCI SDK 不会自动读取这个字段，但我们保留它用于后续注入
                 sdk_config["proxy"] = proxy_url
                 self.log_ui(f"账号 '{selected_alias}' 将通过代理 {proxy_url} 进行连接...", level='INFO')
                 self.logger.info(f"Connecting account '{selected_alias}' using proxy: {proxy_url}")
 
+            # --- 2. 处理私钥文件 ---
             if 'key_content' in sdk_config and sdk_config['key_content']:
                 with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".pem",
                                                  encoding='utf-8') as tf:
-                    tf.write(
-                        sdk_config['key_content']);
+                    tf.write(sdk_config['key_content'])
                     temp_key_file = tf.name
-                sdk_config['key_file'] = temp_key_file;
+                sdk_config['key_file'] = temp_key_file
                 self.logger.info(f"已将 key_content 写入临时文件: {temp_key_file}")
 
-            identity_client_temp = oci.identity.IdentityClient(sdk_config);
-            user_info = identity_client_temp.get_user(user_id=sdk_config["user"]);
-            self.logger.info(f"认证成功！用户: {user_info.data.description}");
+            # --- 3. 初始化 Identity 客户端并注入代理 ---
+            identity_client_temp = oci.identity.IdentityClient(sdk_config)
 
-            self.oci_config = sdk_config;
-            self.identity_client = identity_client_temp;
-            self.compute_client = oci.core.ComputeClient(sdk_config);
-            self.virtual_network_client = oci.core.VirtualNetworkClient(sdk_config);
-            self.block_storage_client = oci.core.BlockstorageClient(sdk_config);
-            self.is_connected = True;
+            # ✨✨✨ 关键修复：在验证连接前就注入代理 ✨✨✨
+            if proxy_url:
+                proxies = {'http': proxy_url, 'https': proxy_url}
+                if hasattr(identity_client_temp, 'base_client') and hasattr(identity_client_temp.base_client, 'session'):
+                    identity_client_temp.base_client.session.proxies = proxies
+                    self.logger.info(f"已为 IdentityClient 注入代理: {proxy_url}")
+
+            # 执行认证测试 (此时已走代理)
+            user_info = identity_client_temp.get_user(user_id=sdk_config["user"])
+            self.logger.info(f"认证成功！用户: {user_info.data.description}")
+
+            # --- 4. 初始化其他客户端并注入代理 ---
+            self.oci_config = sdk_config
+            self.identity_client = identity_client_temp
+            self.compute_client = oci.core.ComputeClient(sdk_config)
+            self.virtual_network_client = oci.core.VirtualNetworkClient(sdk_config)
+            self.block_storage_client = oci.core.BlockstorageClient(sdk_config)
+
+            # 遍历并注入代理给其余客户端
+            if proxy_url:
+                proxies = {'http': proxy_url, 'https': proxy_url}
+                clients_to_patch = [
+                    self.compute_client,
+                    self.virtual_network_client,
+                    self.block_storage_client
+                ]
+                for client in clients_to_patch:
+                    if hasattr(client, 'base_client') and hasattr(client.base_client, 'session'):
+                        client.base_client.session.proxies = proxies
+                        self.logger.info(f"已为 {client.__class__.__name__} 注入代理。")
+
+            self.is_connected = True
             self.connected_profile_alias = selected_alias
+
+            # ✨✨✨ [新增] 检查并自动获取注册时间 ✨✨✨
+            # 如果内存中没有 registration_date，或者值为 None/空，则启动线程去获取
+            current_profile = self.all_profiles_data.get(selected_alias, {})
+            if not current_profile.get('registration_date'):
+                thread = threading.Thread(
+                    target=self.fetch_and_save_tenancy_date,
+                    args=(selected_alias, self.identity_client, sdk_config['tenancy']),
+                    daemon=True
+                )
+                thread.start()
+            # ✨✨✨ [结束] ✨✨✨
 
             def succeed_on_main():
                 self.connected_alias_var.set(f"当前连接账号: {selected_alias}")
-
-                self.log_ui(f"认证成功！已连接到 '{selected_alias}'。", level='INFO');
+                self.log_ui(f"认证成功！已连接到 '{selected_alias}'。", level='INFO')
                 self.last_used_alias = selected_alias
-                self.save_settings_to_file();
-                self.account_treeview.item(selected_alias,
-                                           tags=(
-                                               'connected',));
-                self.toggle_controls(
-                    connected=True, profiles_exist=True, selection_valid=False);
+                self.save_settings_to_file()
+                # 刷新整个列表以更新颜色/状态
+                self.update_account_list()
+                self.toggle_controls(connected=True, profiles_exist=True, selection_valid=False)
                 self.refresh_list_thread()
 
-            if hasattr(self, 'root') and self.root.winfo_exists(): self.root.after(0, succeed_on_main)
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.after(0, succeed_on_main)
+
         except Exception as e:
-            self.is_connected = False;
-            error_msg = f"连接账号 '{selected_alias}' 失败: {e}";
+            self.is_connected = False
+            error_msg = f"连接账号 '{selected_alias}' 失败: {e}"
             self.logger.error(error_msg, exc_info=True)
 
             def fail_on_main():
-                messagebox.showerror("连接失败", error_msg, parent=self.root);
-                self.log_ui(error_msg,
-                            level='ERROR');
-                self.toggle_controls(
-                    connected=False, profiles_exist=bool(self.all_profiles_data), selection_valid=False)
+                messagebox.showerror("连接失败", error_msg, parent=self.root)
+                self.log_ui(error_msg, level='ERROR')
+                self.toggle_controls(connected=False, profiles_exist=bool(self.all_profiles_data), selection_valid=False)
 
-            if hasattr(self, 'root') and self.root.winfo_exists(): self.root.after(0, fail_on_main)
+            if hasattr(self, 'root') and self.root.winfo_exists():
+                self.root.after(0, fail_on_main)
         finally:
             if temp_key_file and os.path.exists(temp_key_file):
                 try:
-                    os.remove(temp_key_file);
+                    os.remove(temp_key_file)
                     self.logger.info(f"已清理临时密钥文件: {temp_key_file}")
                 except OSError as e:
                     self.logger.error(f"清理临时密钥文件失败: {e}")
+
+    def fetch_and_save_tenancy_date(self, alias, identity_client, tenancy_id):
+        """后台线程：获取并保存租户创建时间"""
+        try:
+            self.logger.info(f"正在后台获取账号 '{alias}' 的注册时间...")
+            # 调用 OCI API 获取根区间信息（即租户信息）
+            compartment = identity_client.get_compartment(compartment_id=tenancy_id).data
+            created_at = compartment.time_created
+
+            # 格式化日期
+            date_str = created_at.strftime('%Y-%m-%d')
+
+            # 更新内存数据
+            if alias in self.all_profiles_data:
+                self.all_profiles_data[alias]['registration_date'] = date_str
+                # 保存到文件
+                self.save_profiles_to_file()
+                self.logger.info(f"成功获取并保存 {alias} 的注册时间: {date_str}")
+
+                # 刷新界面显示
+                if hasattr(self, 'root') and self.root.winfo_exists():
+                    self.root.after(0, self.update_account_list)
+        except Exception as e:
+            self.logger.error(f"获取账号 {alias} 的注册时间失败: {e}")
 
     def disconnect_oci(self):
         if not self.is_connected: return
         self.logger.info(f"正在断开与账号 '{self.connected_profile_alias}' 的连接。");
         self.connected_alias_var.set("当前未连接")
-        self.account_treeview.item(self.connected_profile_alias, tags=('disconnected',));
+
+        # 断开时，刷新列表以恢复该账号的普通颜色（奇偶色）
+        self.connected_profile_alias = None
+        self.update_account_list()
+
         self.oci_config, self.identity_client, self.compute_client, self.virtual_network_client, self.block_storage_client = None, None, None, None, None;
-        self.is_connected, self.connected_profile_alias = False, None;
+        self.is_connected = False;
         self.instance_data.clear();
         self.selected_instance_ocid = None
         self.session_subnet_id = None
@@ -1647,7 +1869,6 @@ class OciInstanceManagerApp:
         if profile_data: EditProfileDialog(self.root, self.selected_profile_alias, profile_data,
                                            self.handle_edit_profile)
 
-    # --- ✅ 修改点在这里 ---
     def handle_edit_profile(self, original_alias, new_alias, new_data):
         # 检查传入的公钥是否为空，如果为空则使用默认值
         if not new_data.get('default_ssh_public_key'):
@@ -1655,6 +1876,8 @@ class OciInstanceManagerApp:
 
         # 保留现有的代理设置
         existing_proxy = self.all_profiles_data.get(original_alias, {}).get('proxy')
+        # 保留现有的注册日期 (如果存在)
+        existing_reg_date = self.all_profiles_data.get(original_alias, {}).get('registration_date')
 
         # 合并新旧数据
         if original_alias is None:  # 这是新添加的账号
@@ -1666,6 +1889,9 @@ class OciInstanceManagerApp:
         # 确保代理设置不丢失
         if existing_proxy:
             full_new_data['proxy'] = existing_proxy
+        # 确保注册日期不丢失
+        if existing_reg_date:
+            full_new_data['registration_date'] = existing_reg_date
 
         # 删除旧的子网ID，以便下次连接时重新获取
         if 'default_subnet_ocid' in full_new_data:
@@ -1849,6 +2075,8 @@ class OciInstanceManagerApp:
             del self._drag_data
             if was_moved:
                 self.save_profile_order()
+                # 拖拽结束后，必须刷新斑马纹，否则颜色会乱
+                self.refresh_account_colors()
 
     def save_profile_order(self):
         current_order = self.account_treeview.get_children()
